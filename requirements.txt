@@ -1,0 +1,7 @@
+fastapi==0.136.3
+kaggle==2.2.4
+python-dotenv==1.2.2
+requests==2.33.0
+snowflake-connector-python==3.18.0
+uvicorn==0.47.0
+pydantic==2.12.5
