@@ -1,8 +1,9 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, Field
 import snowflake.connector
 
 load_dotenv()
@@ -30,9 +31,25 @@ app = FastAPI(lifespan=lifespan)
 
 
 class Dataset(BaseModel):
-    ref: str
-    total_bytes: int
-    last_updated: str
+    ref: str = Field(..., min_length=3, description="Kaggle dataset ref in format owner/dataset-name")
+    total_bytes: int = Field(..., ge=0, description="Total size in bytes, must be >= 0")
+    last_updated: str = Field(..., description="ISO 8601 datetime string e.g. 2024-01-01T00:00:00")
+
+    @field_validator("ref")
+    @classmethod
+    def ref_must_contain_slash(cls, v):
+        if "/" not in v:
+            raise ValueError("ref must be in format owner/dataset-name")
+        return v.strip()
+
+    @field_validator("last_updated")
+    @classmethod
+    def last_updated_must_be_valid_datetime(cls, v):
+        try:
+            datetime.fromisoformat(v)
+        except ValueError:
+            raise ValueError("last_updated must be a valid ISO 8601 datetime e.g. 2024-01-01T00:00:00")
+        return v
 
 
 def row_to_dict(row):
