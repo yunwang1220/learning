@@ -1,11 +1,13 @@
 import logging
 import os
+import random
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from kaggle.api.kaggle_api_extended import KaggleApi
 import requests
-import snowflake.connector
+
+from db import get_snowflake_connection, TABLE
 
 load_dotenv()
 
@@ -16,7 +18,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-TABLE = "LF_DEV.TMP.KAGGLE"
 LOOKBACK_HOURS = 24
 PAGE_LIMIT = 11
 MAX_RETRIES = 3
@@ -35,18 +36,8 @@ WHEN NOT MATCHED THEN
 """
 
 
-def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
-    return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        authenticator="externalbrowser",
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=os.environ["SNOWFLAKE_DATABASE"],
-        schema=os.environ["SNOWFLAKE_SCHEMA"]
-    )
 
-
-def load_checkpoint(cursor) -> None:
+def load_checkpoint(cursor) -> datetime | None:
     """Derive checkpoint from MAX(last_updated) in Snowflake."""
     cursor.execute(f"SELECT MAX(last_updated) FROM {TABLE}")
     row = cursor.fetchone()
@@ -59,8 +50,10 @@ def load_checkpoint(cursor) -> None:
     return checkpoint
 
 
+
+
 def fetch_page_with_retry(api: KaggleApi, search_term: str, page: int) -> list:
-    """Fetch a single page with error-specific handling and exponential backoff."""
+    """Fetch a single page with error-specific handling and exponential backoff with jitter."""
     last_error = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -84,12 +77,13 @@ def fetch_page_with_retry(api: KaggleApi, search_term: str, page: int) -> list:
                 return []
 
             elif status == 429:
-                logger.warning(f"Rate limited (429). Waiting {RATE_LIMIT_WAIT}s before retry...")
-                time.sleep(RATE_LIMIT_WAIT)
+                wait = int(e.response.headers.get("Retry-After", RATE_LIMIT_WAIT))
+                logger.warning(f"Rate limited (429). Waiting {wait}s as advised by API...")
+                time.sleep(wait)
 
             elif status in (500, 502, 503):
-                wait = RETRY_BACKOFF ** attempt
-                logger.warning(f"Server error ({status}) on page {page}, attempt {attempt}. Retrying in {wait}s...")
+                wait = (RETRY_BACKOFF ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Server error ({status}) on page {page}, attempt {attempt}. Retrying in {wait:.1f}s...")
                 time.sleep(wait)
 
             else:
@@ -98,14 +92,14 @@ def fetch_page_with_retry(api: KaggleApi, search_term: str, page: int) -> list:
 
         except requests.exceptions.Timeout as e:
             last_error = e
-            wait = RETRY_BACKOFF ** attempt
-            logger.warning(f"Request timed out on page {page}, attempt {attempt}. Retrying in {wait}s...")
+            wait = (RETRY_BACKOFF ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Request timed out on page {page}, attempt {attempt}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
 
         except requests.exceptions.ConnectionError as e:
             last_error = e
-            wait = RETRY_BACKOFF ** attempt
-            logger.warning(f"Connection error on page {page}, attempt {attempt}. Retrying in {wait}s...")
+            wait = (RETRY_BACKOFF ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Connection error on page {page}, attempt {attempt}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
 
     logger.error(f"Page {page} failed after {MAX_RETRIES} attempts, giving up.")
@@ -113,22 +107,34 @@ def fetch_page_with_retry(api: KaggleApi, search_term: str, page: int) -> list:
 
 
 def yield_kaggle_datasets(api: KaggleApi, search_term: str):
-    """Yields individual datasets incrementally from Kaggle."""
+    """Yields individual datasets incrementally from Kaggle, page by page."""
     page = 1
+    total_yielded = 0
+
     while True:
-        logger.info(f"Fetching page {page} for search term: '{search_term}'")
+        logger.info(f"Fetching page {page}/{PAGE_LIMIT} for search term: '{search_term}'")
         batch = fetch_page_with_retry(api, search_term, page)
 
         if not batch:
-            logger.info("No more datasets found, stopping.")
+            logger.info(f"No more datasets on page {page}, pagination complete.")
             break
 
+        batch_size = len(batch)
         yield from batch
+        total_yielded += batch_size
+        logger.info(f"Page {page}: {batch_size} datasets yielded (total so far: {total_yielded})")
+
+        if batch_size < 20:
+            logger.info("Partial page received, pagination complete.")
+            break
+
+        if page >= PAGE_LIMIT:
+            logger.warning(f"Reached page limit ({PAGE_LIMIT}). Some results may be truncated.")
+            break
+
         page += 1
 
-        if page > PAGE_LIMIT:
-            logger.info(f"Reached page limit ({PAGE_LIMIT}), stopping.")
-            break
+    logger.info(f"Pagination finished. Total datasets yielded: {total_yielded}")
 
 
 def validate_dataset(dataset) -> str | None:
@@ -164,23 +170,28 @@ def run(api: KaggleApi, search_term: str) -> None:
                 skipped_records += 1
                 continue
 
-            cursor.execute(MERGE_SQL, {
-                "ref": dataset.ref,
-                "dataset_id": dataset.id,
-                "total_bytes": dataset.total_bytes,
-                "last_updated": dataset.last_updated.isoformat()
-            })
-            new_records += 1
+            try:
+                cursor.execute(MERGE_SQL, {
+                    "ref": dataset.ref,
+                    "dataset_id": dataset.id,
+                    "total_bytes": dataset.total_bytes,
+                    "last_updated": dataset.last_updated.isoformat()
+                })
+                new_records += 1
+            except Exception as e:
+                logger.warning(f"Skipping {dataset.ref!r} due to upsert error: {e}")
+                skipped_records += 1
+                continue
 
             if new_records % COMMIT_BATCH_SIZE == 0:
                 conn.commit()
                 logger.info(f"Committed {new_records} records so far...")
 
-        conn.commit()  # final commit for remaining records
+        conn.commit()
         logger.info(f"Run complete. {new_records} upserted, {skipped_records} skipped.")
 
     except Exception as e:
-        logger.error(f"Run failed: {e}")
+        logger.error(f"Run failed: {e}", exc_info=True)
         raise
 
     finally:
@@ -193,9 +204,7 @@ if __name__ == "__main__":
         api = KaggleApi()
         api.authenticate()
         logger.info("Kaggle API authenticated successfully.")
-    
         run(api, "sentiment")
     except Exception as e:
-        logger.error(f"Authentication failed: {e}")
+        logger.error(f"Startup failed: {e}", exc_info=True)
         raise
-

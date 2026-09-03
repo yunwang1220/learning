@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -6,25 +7,28 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, Field
 import snowflake.connector
 
+from db import get_snowflake_connection, TABLE
+
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 conn = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Connect to Snowflake once on startup (SSO browser window opens here)
     global conn
-    conn = snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        authenticator="externalbrowser",
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=os.environ["SNOWFLAKE_DATABASE"],
-        schema=os.environ["SNOWFLAKE_SCHEMA"]
-    )
+    logger.info("Connecting to Snowflake...")
+    conn = get_snowflake_connection()
+    logger.info("Snowflake connection established.")
     yield
     conn.close()
+    logger.info("Snowflake connection closed.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -32,6 +36,7 @@ app = FastAPI(lifespan=lifespan)
 
 class Dataset(BaseModel):
     ref: str = Field(..., min_length=3, description="Kaggle dataset ref in format owner/dataset-name")
+    dataset_id: int = Field(..., ge=0, description="Kaggle dataset ID")
     total_bytes: int = Field(..., ge=0, description="Total size in bytes, must be >= 0")
     last_updated: str = Field(..., description="ISO 8601 datetime string e.g. 2024-01-01T00:00:00")
 
@@ -53,7 +58,12 @@ class Dataset(BaseModel):
 
 
 def row_to_dict(row):
-    return {"ref": row[0], "total_bytes": row[1], "last_updated": str(row[2])}
+    return {"ref": row[0], "dataset_id": row[1], "total_bytes": row[2], "last_updated": str(row[3])}
+
+
+def get_cursor():
+    """Return a new cursor for each request to avoid thread-safety issues."""
+    return conn.cursor()
 
 
 @app.get("/")
@@ -63,58 +73,97 @@ def read_root():
 
 @app.get("/datasets")
 def list_datasets():
-    cursor = conn.cursor()
-    cursor.execute("SELECT ref, total_bytes, last_updated FROM LF_DEV.TMP.KAGGLE ORDER BY last_updated ASC")
-    return [row_to_dict(row) for row in cursor.fetchall()]
+    cursor = get_cursor()
+    try:
+        cursor.execute(f"SELECT ref, dataset_id, total_bytes, last_updated FROM {TABLE} ORDER BY last_updated ASC")
+        return [row_to_dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to list datasets: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve datasets")
+    finally:
+        cursor.close()
 
 
 @app.get("/datasets/{ref:path}")
 def get_dataset(ref: str):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT ref, total_bytes, last_updated FROM LF_DEV.TMP.KAGGLE WHERE ref = %s",
-        (ref,)
-    )
-    row = cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    return row_to_dict(row)
+    cursor = get_cursor()
+    try:
+        cursor.execute(f"SELECT ref, dataset_id, total_bytes, last_updated FROM {TABLE} WHERE ref = %s", (ref,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        logger.info(f"Fetched dataset: {ref}")
+        return row_to_dict(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get dataset {ref!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve dataset")
+    finally:
+        cursor.close()
 
 
-@app.post("/datasets")
+@app.post("/datasets", status_code=201)
 def create_dataset(dataset: Dataset):
-    cursor = conn.cursor()
-    cursor.execute("SELECT ref FROM LF_DEV.TMP.KAGGLE WHERE ref = %s", (dataset.ref,))
-    if cursor.fetchone():
-        raise HTTPException(status_code=409, detail="Dataset already exists")
-    cursor.execute(
-        "INSERT INTO LF_DEV.TMP.KAGGLE (ref, total_bytes, last_updated) VALUES (%s, %s, %s::TIMESTAMP_NTZ)",
-        (dataset.ref, dataset.total_bytes, dataset.last_updated)
-    )
-    conn.commit()
-    return dataset
+    cursor = get_cursor()
+    try:
+        cursor.execute(f"SELECT ref FROM {TABLE} WHERE ref = %s", (dataset.ref,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Dataset already exists")
+        cursor.execute(
+            f"INSERT INTO {TABLE} (ref, dataset_id, total_bytes, last_updated) VALUES (%s, %s, %s, %s::TIMESTAMP_NTZ)",
+            (dataset.ref, dataset.dataset_id, dataset.total_bytes, dataset.last_updated)
+        )
+        conn.commit()
+        logger.info(f"Created dataset: {dataset.ref}")
+        return dataset
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create dataset {dataset.ref!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create dataset")
+    finally:
+        cursor.close()
 
 
 @app.put("/datasets/{ref:path}")
 def update_dataset(ref: str, dataset: Dataset):
-    cursor = conn.cursor()
-    cursor.execute("SELECT ref FROM LF_DEV.TMP.KAGGLE WHERE ref = %s", (ref,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    cursor.execute(
-        "UPDATE LF_DEV.TMP.KAGGLE SET total_bytes = %s, last_updated = %s::TIMESTAMP_NTZ WHERE ref = %s",
-        (dataset.total_bytes, dataset.last_updated, ref)
-    )
-    conn.commit()
-    return dataset
+    cursor = get_cursor()
+    try:
+        cursor.execute(f"SELECT ref FROM {TABLE} WHERE ref = %s", (ref,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        cursor.execute(
+            f"UPDATE {TABLE} SET dataset_id = %s, total_bytes = %s, last_updated = %s::TIMESTAMP_NTZ WHERE ref = %s",
+            (dataset.dataset_id, dataset.total_bytes, dataset.last_updated, ref)
+        )
+        conn.commit()
+        logger.info(f"Updated dataset: {ref}")
+        return dataset
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update dataset {ref!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update dataset")
+    finally:
+        cursor.close()
 
 
 @app.delete("/datasets/{ref:path}")
 def delete_dataset(ref: str):
-    cursor = conn.cursor()
-    cursor.execute("SELECT ref FROM LF_DEV.TMP.KAGGLE WHERE ref = %s", (ref,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    cursor.execute("DELETE FROM LF_DEV.TMP.KAGGLE WHERE ref = %s", (ref,))
-    conn.commit()
-    return {"message": f"{ref} deleted"}
+    cursor = get_cursor()
+    try:
+        cursor.execute(f"SELECT ref FROM {TABLE} WHERE ref = %s", (ref,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        cursor.execute(f"DELETE FROM {TABLE} WHERE ref = %s", (ref,))
+        conn.commit()
+        logger.info(f"Deleted dataset: {ref}")
+        return {"message": f"{ref} deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete dataset {ref!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete dataset")
+    finally:
+        cursor.close()
