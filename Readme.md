@@ -52,10 +52,10 @@ pip install kaggle snowflake-connector-python python-dotenv fastapi uvicorn
 KAGGLE_USERNAME=your_username
 KAGGLE_KEY=your_api_key
 
-SNOWFLAKE_ACCOUNT=linfox-linfox
+SNOWFLAKE_ACCOUNT=snowflake_account
 SNOWFLAKE_USER=your_email
 SNOWFLAKE_WAREHOUSE=your_warehouse
-SNOWFLAKE_DATABASE=LF_DEV
-SNOWFLAKE_SCHEMA=TMP
+SNOWFLAKE_DATABASE=database
+SNOWFLAKE_SCHEMA=schema
 ```
 
